@@ -1,18 +1,20 @@
 import logging
+import sys
+
 import xarray as xr
 import numpy as np
 
 from ..models import bold
 
 from ..utils.collections import dotdict
-
+from .MPI_function import init_mpi, send_mpi, receive_mpi, end_mpi, reshape_result
 
 class Model:
     """The Model base class runs models, manages their outputs, parameters and more.
     This class should serve as the base class for all implemented models.
     """
 
-    def __init__(self, integration, params):
+    def __init__(self, integration, params, logger=None):
         if hasattr(self, "name"):
             if self.name is not None:
                 assert isinstance(self.name, str), f"Model name is not a string."
@@ -49,7 +51,11 @@ class Model:
 
         self.boldInitialized = False
 
-        logging.info(f"{self.name}: Model initialized.")
+        if logger is None:
+            self.logger = logging.getLogger()
+        else:
+            self.logger = logger
+        self.logger.info(f"{self.name}: Model initialized.")
 
     def initializeBold(self):
         """Initialize BOLD model."""
@@ -64,7 +70,7 @@ class Model:
 
         self.boldModel = bold.BOLDModel(self.params["N"], self.params["dt"])
         self.boldInitialized = True
-        # logging.info(f"{self.name}: BOLD model initialized.")
+        self.logger.info(f"{self.name}: BOLD model initialized.")
 
     def simulateBold(self, t, variables, append=False):
         """Gets the default output of the model and simulates the BOLD model.
@@ -76,17 +82,17 @@ class Model:
                 # the default output is used as the input for the bold model
                 if svn == self.default_output:
                     bold_input = sv[:, self.startindt :]
-                    # logging.debug(f"BOLD input `{svn}` of shape {bold_input.shape}")
+                    self.logger.debug(f"BOLD input `{svn}` of shape {bold_input.shape}")
                     if bold_input.shape[1] >= self.boldModel.samplingRate_NDt:
                         # only if the length of the output has a zero mod to the sampling rate,
                         # the downsampled output from the boldModel can correctly appended to previous data
                         # so: we are lazy here and simply disable appending in that case ...
                         if not bold_input.shape[1] % self.boldModel.samplingRate_NDt == 0:
                             append = False
-                            logging.warn(
+                            self.logger.warn(
                                 f"Output size {bold_input.shape[1]} is not a multiple of BOLD sampling length { self.boldModel.samplingRate_NDt}, will not append data."
                             )
-                        logging.debug(f"Simulating BOLD: boldModel.run(append={append})")
+                        self.logger.debug(f"Simulating BOLD: boldModel.run(append={append})")
 
                         # transform bold input according to self.boldInputTransform
                         if self.boldInputTransform:
@@ -100,11 +106,11 @@ class Model:
                         self.setOutput("BOLD.t_BOLD", t_BOLD)
                         self.setOutput("BOLD.BOLD", BOLD)
                     else:
-                        logging.warn(
+                        self.logger.warn(
                             f"Will not simulate BOLD if output {bold_input.shape[1]*self.params['dt']} not at least of duration {self.boldModel.samplingRate_NDt*self.params['dt']}"
                         )
         else:
-            logging.warn("BOLD model not initialized, not simulating BOLD. Use `run(bold=True)`")
+            self.logger.warn("BOLD model not initialized, not simulating BOLD. Use `run(bold=True)`")
 
     def checkChunkwise(self, chunksize):
         """Checks if the model fulfills requirements for chunkwise simulation.
@@ -116,7 +122,7 @@ class Model:
 
         # throw a warning if the user is nasty
         if int(self.params["duration"] / self.params["dt"]) % chunksize != 0:
-            logging.warning(
+            self.logger.warning(
                 f"It is strongly advised to use a `chunksize` ({chunksize}) that is a divisor of `duration / dt` ({int(self.params['duration']/self.params['dt'])})."
             )
 
@@ -188,6 +194,11 @@ class Model:
         append=False,
         append_outputs=None,
         continue_run=False,
+        mpi=False,
+        path_mpi_input=None,
+        path_mpi_output = None,
+        id_proxy = None,
+        coupling_function=None
     ):
         """
         Main interfacing function to run a model.
@@ -213,6 +224,11 @@ class Model:
         # TODO: legacy argument support
         if append_outputs is not None:
             append = append_outputs
+        if mpi:
+            if not chunkwise or not append or id_proxy is None or coupling_function is None:
+                raise(Exception('MPI communication needs chunkwise integration append result or missing id_proxy'))
+            self.comm_input = init_mpi(path_mpi_input, self.logger)
+            self.comm_output = init_mpi(path_mpi_output, self.logger)
 
         # if a previous run is not to be continued clear the model's state
         if continue_run is False:
@@ -236,28 +252,32 @@ class Model:
             # and whether sampling_dt is compatible with duration and chunksize
             self.checkChunkwise(chunksize)
             if bold and not self.boldInitialized:
-                logging.warn(f"{self.name}: BOLD model not initialized, not simulating BOLD. Use `run(bold=True)`")
+                self.logger.warn(f"{self.name}: BOLD model not initialized, not simulating BOLD. Use `run(bold=True)`")
                 bold = False
-            self.integrateChunkwise(chunksize=chunksize, bold=bold, append_outputs=append)
+            self.integrateChunkwise(chunksize=chunksize, bold=bold, append_outputs=append,
+                                    mpi=mpi, id_proxy=id_proxy, coupling_function=coupling_function)
 
         # check if there was a problem with the simulated data
         self.checkOutputs()
+        if mpi:
+            end_mpi(self.comm_input,  path_mpi_input, False, self.logger)
+            end_mpi(self.comm_output, path_mpi_output, True, self.logger)
 
     def checkOutputs(self):
         # check nans in output
         if np.isnan(self.output).any():
-            logging.error("nan in model output!")
+            self.logger.error("nan in model output!")
         else:
             EXPLOSION_THRESHOLD = 1e20
             if (self.output > EXPLOSION_THRESHOLD).any() > 0:
-                logging.error("nan in model output!")
+                self.logger.error("nan in model output!")
 
         # check nans in BOLD
         if "BOLD" in self.outputs:
             if np.isnan(self.outputs.BOLD.BOLD).any():
-                logging.error("nan in BOLD output!")
+                self.logger.error("nan in BOLD output!")
 
-    def integrate(self, append_outputs=False, simulate_bold=False):
+    def integrate(self, append_outputs=False, simulate_bold=False, mpi=False, coupling_function=None, id_proxy=None, chunksize=1):
         """Calls each models `integration` function and saves the state and the outputs of the model.
 
         :param append: append the chunkwise outputs to the outputs attribute, defaults to False, defaults to False
@@ -265,6 +285,19 @@ class Model:
         """
         # run integration
         t, *variables = self.integration(self.params)
+
+        if mpi:
+            dt = self.params['dt']
+            self.logger.info("Neurolib receive data start")
+            # receive MPI data
+            receive = receive_mpi(self.comm_input, self.logger)
+            time_data = receive[0]
+            data_value = receive[1]
+            self.logger.info("Neurolib receive data values "+str(data_value)+" chuncksize "+str(chunksize))
+            variables[0][id_proxy, -chunksize: ] = data_value
+            send_mpi(self.comm_output, [time_data[1]+chunksize*dt,time_data[1]+2*chunksize*dt],
+                 coupling_function(self.params, self.init_vars, id_proxy, chunksize), self.logger)
+
         self.storeOutputsAndStates(t, variables, append=append_outputs)
 
         # force bold if params['bold'] == True
@@ -275,7 +308,7 @@ class Model:
         if simulate_bold and self.boldInitialized:
             self.simulateBold(t, variables, append=True)
 
-    def integrateChunkwise(self, chunksize, bold=False, append_outputs=False):
+    def integrateChunkwise(self, chunksize, bold=False, append_outputs=False, mpi=False, id_proxy=None, coupling_function=None):
         """Repeatedly calls the chunkwise integration for the whole duration of the simulation.
         If `bold==True`, the BOLD model is simulated after each chunk.
 
@@ -289,6 +322,37 @@ class Model:
         totalDuration = self.params["duration"]
 
         dt = self.params["dt"]
+        if mpi:
+            self.logger.info("send initialisation of Neurolib : prepare data")
+            time_init = [0, chunksize*dt]
+            self.logger.info("send initialisation of Neurolib : send data")
+            def computeDelayMatrix(lengthMat, signalV, segmentLength=1):
+                normalizedLenMat = lengthMat * segmentLength
+                if signalV > 0:
+                    Dmat = normalizedLenMat / signalV  # Interareal delays in ms
+                else:
+                    Dmat = lengthMat * 0.0
+                return Dmat
+
+            N = len(self.Cmat)  # Number of areas
+
+            # Interareal connection delay
+            lengthMat = self.params["lengthMat"]
+            signalV = self.params["signalV"]
+
+            if N == 1:
+                Dmat = np.ones((N, N)) * self.params["de"]
+            else:
+                Dmat = computeDelayMatrix(
+                    lengthMat, signalV
+                )  # Interareal connection delays, Dmat(i,j) Connnection from jth node to ith (ms)
+                Dmat[np.eye(len(Dmat)) == 1] = np.ones(len(Dmat)) * self.params["de"]
+            Dmat_ndt = np.around(Dmat / dt).astype(int)  # delay matrix in multiples of dt
+            self.params['Dmat_ndt'] = Dmat
+            send_mpi(self.comm_output, time_init, coupling_function(self.params, self.init_vars, id_proxy, chunksize), self.logger)
+
+
+
         # create a shallow copy of the parameters
         lastT = 0
         while totalDuration - lastT >= dt - 1e-6:
@@ -296,8 +360,7 @@ class Model:
             # account for floating point errors
             remainingChunkSize = int(round((totalDuration - lastT) / dt))
             currentChunkSize = min(chunksize, remainingChunkSize)
-
-            self.autochunk(chunksize=currentChunkSize, append_outputs=append_outputs, bold=bold)
+            self.autochunk(chunksize=currentChunkSize, append_outputs=append_outputs, bold=bold, mpi=mpi, id_proxy=id_proxy, coupling_function=coupling_function)
             # we save the last simulated time step
             lastT += currentChunkSize * dt
             # or
@@ -370,7 +433,7 @@ class Model:
         for i, iv in enumerate(self.input_vars):
             self.params[iv] = inputs[i].copy()
 
-    def autochunk(self, inputs=None, chunksize=1, append_outputs=False, bold=False):
+    def autochunk(self, inputs=None, chunksize=1, append_outputs=False, bold=False, mpi=False, coupling_function=None, id_proxy=None):
         """Executes a single chunk of integration, either for a given duration
         or a single timestep `dt`. Gathers all inputs to the model and resets
         the initial conditions as a preparation for the next chunk.
@@ -391,7 +454,8 @@ class Model:
             self.setInputs(inputs)
 
         # run integration
-        self.integrate(append_outputs=append_outputs, simulate_bold=bold)
+        self.integrate(append_outputs=append_outputs, simulate_bold=bold, mpi=mpi,
+                       coupling_function=coupling_function, id_proxy=id_proxy, chunksize=chunksize)
 
         # set initial conditions to last state for the next chunk
         self.setInitialValuesToLastState()
@@ -599,7 +663,7 @@ class Model:
             for k in outputDict:
                 if k.startswith("t"):
                     timeDictKey = k
-                    logging.info(f"Assuming {k} to be the time axis.")
+                    self.logger.info(f"Assuming {k} to be the time axis.")
                     break
         assert len(timeDictKey) > 0, f"No time array found (starting with t) in output group {group}."
         t = outputDict[timeDictKey].copy()
