@@ -7,7 +7,7 @@ import numpy as np
 from ..models import bold
 
 from ..utils.collections import dotdict
-from .MPI_function import init_mpi, send_mpi, receive_mpi, end_mpi, reshape_result
+from .MPI_function import init_mpi, send_mpi, receive_mpi, end_mpi
 
 class Model:
     """The Model base class runs models, manages their outputs, parameters and more.
@@ -292,9 +292,9 @@ class Model:
             # receive MPI data
             receive = receive_mpi(self.comm_input, self.logger)
             time_data = receive[0]
-            data_value = receive[1]
+            data_value = receive[1]*10
             self.logger.info("Neurolib receive data values "+str(data_value)+" chuncksize "+str(chunksize))
-            variables[0][id_proxy, -chunksize: ] = data_value
+            variables[0][id_proxy, -chunksize:] = data_value
             send_mpi(self.comm_output, [time_data[1]+chunksize*dt,time_data[1]+2*chunksize*dt],
                  coupling_function(self.params, self.init_vars, id_proxy, chunksize), self.logger)
 

@@ -53,7 +53,7 @@ class ALNModel(Model):
     input_vars = ["ext_exc_current", "ext_exc_rate"]
     default_input = "ext_exc_rate"
 
-    def __init__(self, params=None, Cmat=None, Dmat=None, lookupTableFileName=None, seed=None):
+    def __init__(self, params=None, Cmat=None, Dmat=None, lookupTableFileName=None, seed=None, logger=None):
         """
         :param params: parameter dictionary of the model
         :param Cmat: Global connectivity matrix (connects E to E)
@@ -78,7 +78,7 @@ class ALNModel(Model):
             )
 
         # Initialize base class Model
-        super().__init__(integration=integration, params=params)
+        super().__init__(integration=integration, params=params, logger=logger)
 
     def getMaxDelay(self):
         # compute maximum delay of model
